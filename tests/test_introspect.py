@@ -62,6 +62,52 @@ def test_detect_fts_similar_tables(fresh_db, reverse_order):
     assert fresh_db.table(table2).detect_fts() == f"{table2}_fts"
 
 
+@pytest.mark.parametrize("fts_version", ("FTS4", "FTS5"))
+@pytest.mark.parametrize(
+    "table_name,decoy_name",
+    (
+        # _ and % are LIKE wildcards - "foo_bar" as a pattern also matches "fooXbar"
+        ("foo_bar", "fooXbar"),
+        ("foo%bar", "fooXbar"),
+        ("foo_bar%baz", "fooXbarYbaz"),
+        # backslash and double quotes must also be matched literally
+        ("foo\\bar", "fooXbar"),
+        ('fo"o_bar', None),
+    ),
+)
+def test_detect_fts_like_wildcards_in_table_names(
+    fresh_db, fts_version, table_name, decoy_name
+):
+    # The decoy table is created first so its FTS table sorts first in
+    # sqlite_master - a wildcard match would incorrectly return it
+    if decoy_name is not None:
+        fresh_db.table(decoy_name).insert({"title": "Decoy"}).enable_fts(
+            ["title"], fts_version=fts_version
+        )
+    fresh_db.table(table_name).insert({"title": "Hello"}).enable_fts(
+        ["title"], fts_version=fts_version
+    )
+    assert fresh_db.table(table_name).detect_fts() == f"{table_name}_fts"
+    if decoy_name is not None:
+        assert fresh_db.table(decoy_name).detect_fts() == f"{decoy_name}_fts"
+
+
+@pytest.mark.parametrize("fts_version", ("FTS4", "FTS5"))
+def test_detect_fts_wildcard_name_does_not_match_other_tables_index(
+    fresh_db, fts_version
+):
+    # A table named "foo_bar" with no FTS of its own must not detect the
+    # FTS index belonging to the similarly-named "fooXbar" table
+    fresh_db.table("fooXbar").insert({"title": "Decoy"}).enable_fts(
+        ["title"], fts_version=fts_version
+    )
+    fresh_db.table("foo_bar").insert({"title": "Hello"})
+    fresh_db.table("foo%bar").insert({"title": "Hello"})
+    assert fresh_db.table("foo_bar").detect_fts() is None
+    assert fresh_db.table("foo%bar").detect_fts() is None
+    assert fresh_db.table("fooXbar").detect_fts() == "fooXbar_fts"
+
+
 def test_tables(existing_db):
     assert len(existing_db.tables) == 1
     assert existing_db.tables[0].name == "foo"

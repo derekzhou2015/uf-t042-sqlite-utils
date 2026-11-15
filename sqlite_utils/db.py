@@ -99,6 +99,14 @@ def quote_identifier(identifier: str) -> str:
     return '"{}"'.format(identifier.replace('"', '""'))
 
 
+def _escape_like(value: str) -> str:
+    """
+    Escape the LIKE pattern wildcards (``\\``, ``%`` and ``_``) in ``value``
+    so it matches literally when used with ``ESCAPE '\\'``.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _check_constraint_sql(check: Check) -> str:
     prefix = f"CONSTRAINT {quote_identifier(check.name)} " if check.name else ""
     newline = "\n" if sql_ends_in_line_comment(check.check) else ""
@@ -3872,13 +3880,25 @@ class Table(Queryable):
         if fts_table:
             self.db[fts_table].drop()
         # Now delete the triggers that related to that table
+        # (escape LIKE wildcards in the table name so triggers belonging
+        # to similarly-named tables are not matched by accident)
         sql = textwrap.dedent("""
             SELECT name FROM sqlite_master
                 WHERE type = 'trigger'
-                AND (sql LIKE '% INSERT INTO [{}]%' OR sql LIKE '% INSERT INTO "{}"%')
-        """).strip().format(fts_table, fts_table)
+                AND (
+                    sql LIKE :like ESCAPE '\\'
+                    OR sql LIKE :like2 ESCAPE '\\'
+                )
+        """).strip()
+        escaped = _escape_like(fts_table or "")
         trigger_names = []
-        for row in self.db.execute(sql).fetchall():
+        for row in self.db.execute(
+            sql,
+            {
+                "like": f"% INSERT INTO [{escaped}]%",
+                "like2": f'% INSERT INTO "{escaped}"%',
+            },
+        ).fetchall():
             trigger_names.append(row[0])
         with self.db.atomic():
             for trigger_name in trigger_names:
@@ -3907,17 +3927,23 @@ class Table(Queryable):
             SELECT name FROM sqlite_master
                 WHERE rootpage = 0
                 AND (
-                    sql LIKE :like
-                    OR sql LIKE :like2
+                    sql LIKE :like ESCAPE '\\'
+                    OR sql LIKE :like2 ESCAPE '\\'
                     OR (
                         tbl_name = :table
                         AND sql LIKE '%VIRTUAL TABLE%USING FTS%'
                     )
                 )
         """).strip()
+        # The table name is embedded in LIKE patterns, so escape LIKE
+        # wildcards (%, _, \) to match it literally - otherwise a table
+        # named e.g. "foo_bar" would also match an FTS table for "fooXbar".
+        # Double quotes are stored doubled in the content="..." option.
         args = {
-            "like": f"%VIRTUAL TABLE%USING FTS%content=[{self.name}]%",
-            "like2": f'%VIRTUAL TABLE%USING FTS%content="{self.name}"%',
+            "like": f"%VIRTUAL TABLE%USING FTS%content=[{_escape_like(self.name)}]%",
+            "like2": '%VIRTUAL TABLE%USING FTS%content="{}"%'.format(
+                _escape_like(self.name.replace('"', '""'))
+            ),
             "table": self.name,
         }
         rows = self.db.execute(sql, args).fetchall()

@@ -85,6 +85,65 @@ def test_enable_fts_escape_table_names(fresh_db):
     assert [] == list(table.search("bar"))
 
 
+@pytest.mark.parametrize("fts_version", ("FTS4", "FTS5"))
+@pytest.mark.parametrize(
+    "table_name,decoy_name",
+    (
+        ("foo_bar", "fooXbar"),
+        ("foo%bar", "fooXbar"),
+    ),
+)
+def test_fts_all_paths_with_like_wildcard_table_names(
+    fresh_db, fts_version, table_name, decoy_name
+):
+    # All five detect_fts() consumers - search, parameterized search,
+    # optimize, rebuild_fts and disable_fts - must act on the index
+    # belonging to the exact table, not a similarly-named decoy whose
+    # name matches the table's name as a LIKE pattern
+    decoy = fresh_db.table(decoy_name)
+    decoy.insert({"text": "decoy tanuki"}).enable_fts(
+        ["text"], fts_version=fts_version, create_triggers=True
+    )
+    table = fresh_db.table(table_name)
+    table.insert({"text": "real tanuki"}).enable_fts(
+        ["text"], fts_version=fts_version, create_triggers=True
+    )
+    decoy_fts = f"{decoy_name}_fts"
+    table_fts = f"{table_name}_fts"
+    assert table.detect_fts() == table_fts
+    assert decoy.detect_fts() == decoy_fts
+
+    # 1. search path returns this table's rows only
+    assert [row["text"] for row in table.search("tanuki")] == ["real tanuki"]
+    # 2. parameterized query path
+    assert [
+        row["text"]
+        for row in table.search(
+            "tanuki", where="rowid = :rowid", where_args={"rowid": 1}
+        )
+    ] == ["real tanuki"]
+    # 3. optimize path - operates on the correct index
+    table.optimize()
+    # 4. rebuild path - rebuilds this table's index, leaves the decoy's intact
+    table.rebuild_fts()
+    assert [row["text"] for row in table.search("tanuki")] == ["real tanuki"]
+    assert [row["text"] for row in decoy.search("tanuki")] == ["decoy tanuki"]
+
+    # 5. disable path - drops only this table's index and triggers
+    table.disable_fts()
+    assert table.detect_fts() is None
+    assert table_fts not in fresh_db.table_names()
+    # decoy index, data and triggers are untouched
+    assert decoy.detect_fts() == decoy_fts
+    assert decoy_fts in fresh_db.table_names()
+    assert [row["text"] for row in decoy.search("tanuki")] == ["decoy tanuki"]
+    assert {t.name for t in decoy.triggers} == {
+        f"{decoy_name}_ai",
+        f"{decoy_name}_ad",
+        f"{decoy_name}_au",
+    }
+
+
 def test_search_duplicate_columns_are_deduped(fresh_db):
     # https://github.com/simonw/sqlite-utils/issues/624
     table = fresh_db.table("t")
